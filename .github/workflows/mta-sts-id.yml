@@ -1,0 +1,170 @@
+# Keep the MTA-STS policy id in DNS in step with the policy file.
+#
+# WHY THIS MATTERS
+# Sending MTAs cache the policy keyed on the `id` in the _mta-sts TXT record and
+# refetch only when that value changes (RFC 8461 §3.1). If the policy file is
+# edited without bumping the id, senders holding a cached copy never see the new
+# policy — for up to `max_age`, which is 28 days here. Because the policy is
+# `mode: enforce`, a stale cache does not fail open: senders keep enforcing the
+# OLD mx list and refuse delivery to anything else. An urgent MX change would
+# therefore take up to four weeks to reach them.
+#
+# HOW IT WORKS
+# The expected id is derived from the commit timestamp of .well-known/mta-sts.txt,
+# so it is impossible for the policy to change without the id changing too.
+#
+# TWO MODES
+#   - Detect only (default, zero setup): drift fails the run with the exact
+#     record to publish.
+#   - Auto-update (optional): set the repository variables below and the run
+#     writes the record to Route 53 itself via OIDC — no stored AWS keys.
+#         vars.AWS_ROLE_ARN        e.g. arn:aws:iam::123456789012:role/gh-mta-sts
+#         vars.MTA_STS_ZONE_ID     the Route 53 hosted zone ID for kelh.net
+#     The IAM role needs only ChangeResourceRecordSets on that hosted zone, and a
+#     trust policy admitting this repository through token.actions.githubusercontent.com.
+name: MTA-STS policy id
+
+on:
+  push:
+    branches: ["main"]
+    paths: [".well-known/mta-sts.txt"]
+  schedule:
+    # Weekly drift check, in case the record is edited outside this workflow.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "mta-sts-id"
+  cancel-in-progress: false
+
+env:
+  POLICY_DOMAIN: kelh.net
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for the optional Route 53 update
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the expected id is the policy file's commit timestamp.
+          fetch-depth: 0
+
+      - name: Derive expected id from the policy file's last commit
+        id: expect
+        run: |
+          set -euo pipefail
+          FILE=.well-known/mta-sts.txt
+          test -f "$FILE" || { echo "::error::$FILE is missing"; exit 1; }
+          want=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M%SZ -- "$FILE")
+          if [ -z "$want" ]; then
+            echo "::error::could not read a commit timestamp for $FILE"
+            exit 1
+          fi
+          echo "want=$want" >> "$GITHUB_OUTPUT"
+          echo "Policy last changed: $want"
+          echo "--- policy ---"
+          cat "$FILE"
+
+      - name: Read the id currently published in DNS
+        id: dns
+        run: |
+          set -euo pipefail
+          rr=$(dig +short TXT "_mta-sts.${POLICY_DOMAIN}" | tr -d '"' | tr -d '\n')
+          echo "TXT record: ${rr:-<empty>}"
+          have=$(printf '%s' "$rr" | grep -oE 'id=[A-Za-z0-9]+' | head -1 | cut -d= -f2 || true)
+          echo "have=$have" >> "$GITHUB_OUTPUT"
+          echo "Published id: ${have:-<none>}"
+
+      - name: Compare
+        id: cmp
+        run: |
+          set -euo pipefail
+          want='${{ steps.expect.outputs.want }}'
+          have='${{ steps.dns.outputs.have }}'
+          if [ "$want" = "$have" ]; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            echo "In sync ($have)."
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::MTA-STS id drift — DNS has '${have:-<none>}', policy expects '$want'"
+          fi
+
+      # ── optional auto-update ────────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        if: steps.cmp.outputs.drift == 'true' && vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Publish the new id to Route 53
+        if: steps.cmp.outputs.drift == 'true' && vars.AWS_ROLE_ARN != ''
+        run: |
+          set -euo pipefail
+          want='${{ steps.expect.outputs.want }}'
+          cat > /tmp/change.json <<JSON
+          {
+            "Comment": "Sync MTA-STS policy id with .well-known/mta-sts.txt",
+            "Changes": [{
+              "Action": "UPSERT",
+              "ResourceRecordSet": {
+                "Name": "_mta-sts.${POLICY_DOMAIN}.",
+                "Type": "TXT",
+                "TTL": 3600,
+                "ResourceRecords": [{ "Value": "\"v=STSv1; id=${want}\"" }]
+              }
+            }]
+          }
+          JSON
+          cat /tmp/change.json
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id "${{ vars.MTA_STS_ZONE_ID }}" \
+            --change-batch file:///tmp/change.json
+          echo "Published id=$want"
+
+      # ── report ──────────────────────────────────────────────────────────
+      - name: Report
+        if: always()
+        run: |
+          want='${{ steps.expect.outputs.want }}'
+          have='${{ steps.dns.outputs.have }}'
+          {
+            if [ '${{ steps.cmp.outputs.drift }}' != 'true' ]; then
+              echo "### MTA-STS id in sync"
+              echo ""
+              echo "\`id=$want\` matches the published policy."
+            elif [ -n '${{ vars.AWS_ROLE_ARN }}' ]; then
+              echo "### MTA-STS id updated"
+              echo ""
+              echo "\`$have\` → \`$want\` in Route 53."
+            else
+              echo "### MTA-STS id is stale"
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| Published in DNS | \`${have:-none}\` |"
+              echo "| Policy expects | \`$want\` |"
+              echo ""
+              echo "Update the \`_mta-sts.${POLICY_DOMAIN}\` TXT record to:"
+              echo ""
+              echo "\`\`\`"
+              echo "v=STSv1; id=$want"
+              echo "\`\`\`"
+              echo ""
+              echo "Set \`vars.AWS_ROLE_ARN\` and \`vars.MTA_STS_ZONE_ID\` to have this"
+              echo "workflow apply the change itself."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on unresolved drift
+        if: steps.cmp.outputs.drift == 'true' && vars.AWS_ROLE_ARN == ''
+        run: |
+          echo "::error::MTA-STS policy id is stale. DNS has '${{ steps.dns.outputs.have }}', policy expects '${{ steps.expect.outputs.want }}'. See the job summary."
+          exit 1
